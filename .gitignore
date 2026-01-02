@@ -176,3 +176,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+sleepfm/pretrained_model/
+output/
+output_one_modality/
+output_one_modality_new/
+sleepfm/ml_model/old_version
+.vscode/
+notebooks/
+sleepfm/pipeline/problem_hdf5.txt

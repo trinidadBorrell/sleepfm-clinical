@@ -3,7 +3,7 @@
 dataset_name=mesa
 splits=train,validation,test
 num_workers=16
-model_path="../checkpoints//SetTransformer/leave_one_out_128_patch_size_3840"
+model_path="/home/triniborrell/home/projects/sleepfm-clinical/sleepfm/pretrained_model/"
 
 python generate_embeddings.py \
     --num_workers $num_workers \

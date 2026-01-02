@@ -16,6 +16,11 @@ import json
 from loguru import logger
 from einops import rearrange
 
+# Configure logger if not already configured
+import logging
+if not logger._core.handlers:
+    logger.add(sys.stderr, level="INFO")
+
 
 def index_file_helper(args):
     file_path, channel_like, chunk_size, channel_groups, modality_types = args
@@ -23,6 +28,11 @@ def index_file_helper(args):
     modality_to_channels = {modality_type: [] for modality_type in modality_types}
     try:
         with h5py.File(file_path, 'r', rdcc_nbytes = 300 * 512 * 8 * 2) as hf:
+            logger.info(f"HDF5 file {file_path} contains keys: {list(hf.keys())}")
+            # Print detailed info about each dataset
+            for key in hf.keys():
+                if isinstance(hf[key], h5py.Dataset):
+                    logger.info(f"  {key}: shape={hf[key].shape}, dtype={hf[key].dtype}")
             dset_names = []
             for dset_name in hf.keys():
                 if not channel_like or dset_name in channel_like:
@@ -37,15 +47,20 @@ def index_file_helper(args):
                         if dset_name in channel_groups["EMG"]:
                             modality_to_channels["EMG"].append(dset_name)
             flag = True
+            logger.info(f"File {file_path}: Found channels - {modality_to_channels}")
             for modality, channels in modality_to_channels.items():
                 if len(channels) == 0:
+                    logger.warning(f"Missing channels for modality {modality}")
                     flag = False
                     break
             if flag:
                 num_samples = hf[dset_name].shape[0]
                 num_chunks = num_samples // chunk_size
+                logger.info(f"File {file_path}: {num_samples} samples, {num_chunks} chunks of size {chunk_size}")
                 for chunk_start in range(0, num_chunks * chunk_size, chunk_size):
                     file_index_map.append((file_path, dset_names, chunk_start))
+            else:
+                logger.warning(f"Skipping file {file_path} due to missing modalities")
     except (OSError, AttributeError) as e:
         with open("problem_hdf5.txt", "a") as f:
             f.write(f"Error processing file {file_path}: {str(e)}\n")

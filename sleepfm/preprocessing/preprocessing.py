@@ -15,6 +15,7 @@ import argparse
 import warnings
 from scipy.signal import butter, filtfilt
 import mne
+import sys
 
 
 class EDFToHDF5Converter:
@@ -372,25 +373,381 @@ class EDFToHDF5Converter:
         resampled_signals = self.resample_signals(signals, sample_rates)
         #self.plot_results(resampled_signals, channel_names)
         self.plot_first_results(resampled_signals, channel_names)
+
+
+class FIFToHDF5Converter:
+    def __init__(self, root_dir, target_dir, resample_rate=512, num_threads=1, num_files=-1):
+        self.resample_rate = resample_rate 
+        self.root_dir = root_dir
+        self.target_dir = target_dir
+        self.num_threads = num_threads
+        self.num_files = num_files
+        self.file_locations = self.get_files() 
+
+    def get_files(self):
+        # Search for all '.fif' files within each subdirectory of the root directory
+        file_paths = glob.glob(os.path.join(self.root_dir, '**/*.[fF][iI][fF]'), recursive=True)
+        file_names = [os.path.basename(path) for path in file_paths]
+        return file_paths, file_names
+
+    def read_fif(self, file_path):
+        logger.info('reading fif')
+        epochs = mne.read_epochs(file_path)
+        signals = epochs.get_data()
+        print(f'Signals shape {signals.shape}')
+        #combine axis 0 with axis 2
+        signals = signals.reshape(signals.shape[1], -1)
+        print(f'Signals shape after combining epochs across time {signals.shape}')
+        
+        # All channels have the same sample rate
+        sample_rate = epochs.info['sfreq']
+        sample_rates = np.full(signals.shape[0], sample_rate)
+        
+        channel_names = np.array(epochs.ch_names)
+        return signals, sample_rates, channel_names
+
+    def safe_standardize(self, signal):
+        mean = np.mean(signal)
+        std = np.std(signal)
+        
+        if std == 0:
+            standardized_signal = (signal - mean)
+        else:
+            standardized_signal = (signal - mean) / std
+        
+        return standardized_signal
+        
+    def filter_signal(self, signal, sample_rate):
+        print("Filtering signal")
+        nyquist_freq = sample_rate / 2
+        cutoff = min(self.resample_rate / 2, nyquist_freq)
+        normalized_cutoff = cutoff / nyquist_freq
+        b, a = butter(4, normalized_cutoff, btype='low', analog=False)
+        filtered_signal = filtfilt(b, a, signal)
+        return filtered_signal
+
+    def resample_signals(self, signals, sample_rates):
+        logger.info('resampling signals')
+        resampled_signals = []
+        for signal, rate in zip(signals, sample_rates):
+            # signal is a 1D array for each channel after combining epochs
+            duration = len(signal) / rate
+            
+            # Original time points
+            original_time_points = np.linspace(0, duration, num=len(signal), endpoint=False)
+            
+            # New sample rate and new time points
+            new_sample_count = int(duration * self.resample_rate)
+            new_time_points = np.linspace(0, duration, num=new_sample_count, endpoint=False)
+
+            # filter signal
+            if rate > self.resample_rate:
+                signal = self.filter_signal(signal, rate)
+            
+            # Linear interpolation
+            resampled_signal = np.interp(new_time_points, original_time_points, signal)
+            
+            # Standardize the resampled signal
+            standardized_signal = self.safe_standardize(resampled_signal)
+            
+            if np.isnan(standardized_signal).any():
+                logger.info('Found NaN in the resampled signal.')
+                continue
+
+            resampled_signals.append(standardized_signal)
+        
+        return np.stack(resampled_signals)  # Stack for a consistent output format
+
+    def save_to_hdf5(self, signals, channel_names, file_path):
+        logger.info('saving hdf5')
+        samples_per_chunk = 5 * 60 * self.resample_rate
+        
+        # Define the required channels based on config
+        required_channels = {
+            "BAS": ["E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10"],
+            "RESP": ["E11", "E12", "E13", "E14", "E15", "E16", "E17"],
+            "EKG": ["E18", "E19"],
+            "EMG": ["E20", "E21", "E22", "E23"]
+        }
+        
+        with h5py.File(file_path, 'w') as hdf:
+            # Process each modality
+            for modality, channel_list in required_channels.items():
+                for channel_name in channel_list:
+                    if modality == "BAS" and channel_names is not None and len(channel_names) > 0:
+                        # Use actual EEG data for first 10 channels
+                        channel_idx = channel_list.index(channel_name)
+                        if channel_idx < len(signals):
+                            signal = signals[channel_idx]
+                        else:
+                            # If not enough channels, create zeros
+                            signal = np.zeros_like(signals[0])
+                    else:
+                        # Create dummy data for RESP, EKG, EMG
+                        if signals is not None and len(signals) > 0:
+                            signal = np.zeros_like(signals[0])
+                        else:
+                            # Create a dummy signal with proper length
+                            signal = np.zeros(samples_per_chunk * 10)  # 50 seconds of data
+                    
+                    hdf.create_dataset(channel_name, data=signal,
+                                       dtype='float16', chunks=(samples_per_chunk,), compression="gzip")
+
+    def _get_unique_name(self, hdf, base_name):
+        # Helper method to ensure dataset names are unique
+        i = 1
+        unique_name = base_name
+        while unique_name in hdf:
+            unique_name = f"{base_name}_{i}"
+            i += 1
+        return unique_name
+    
+    def convert(self, fif_path, hdf5_path):
+        signals, sample_rates, channel_names = self.read_fif(fif_path)
+        resampled_signals = self.resample_signals(signals, sample_rates)
+        
+        # Only keep first 10 channels for BAS (E1-E10)
+        bas_signals = resampled_signals[:10] if len(resampled_signals) >= 10 else resampled_signals
+        bas_channel_names = [f"E{i+1}" for i in range(len(bas_signals))]
+        
+        # Save with proper channel structure
+        self.save_to_hdf5(bas_signals, bas_channel_names, hdf5_path)
+
+    def convert_multiprocessing(self, args):
+        fif_files = args
+        print(f"[DEBUG] Starting conversion for {len(fif_files)} files", flush=True)
+        sys.stdout.flush()
+        
+        for fif_file in tqdm(fif_files, desc="Converting FIF files"):
+            print(f"[DEBUG] Processing file: {fif_file}", flush=True)
+            sys.stdout.flush()
+
+            if fif_file.endswith(".fif"):
+                replace_str = ".fif"
+            elif fif_file.endswith(".FIF"):
+                replace_str = ".FIF"
+            hdf5_file = os.path.join(self.target_dir, fif_file.split('/')[-1].replace(replace_str, '.hdf5'))
+            print(f"[DEBUG] Output HDF5 file: {hdf5_file}", flush=True)
+            sys.stdout.flush()
+
+            if os.path.exists(hdf5_file):
+                print(f"[DEBUG] File already exists, skipping: {hdf5_file}", flush=True)
+                sys.stdout.flush()
+                continue
+                
+            try:
+                print(f"[DEBUG] Converting {fif_file} to {hdf5_file}", flush=True)
+                sys.stdout.flush()
+                self.convert(fif_file, hdf5_file)
+                print(f"[DEBUG] Successfully converted {fif_file}", flush=True)
+                sys.stdout.flush()
+                
+                # Verify the file was created correctly
+                if os.path.exists(hdf5_file):
+                    print(f"[DEBUG] File created: {hdf5_file}", flush=True)
+                    sys.stdout.flush()
+                    with h5py.File(hdf5_file, 'r') as f:
+                        print(f"[DEBUG] HDF5 file contains {len(f.keys())} datasets: {list(f.keys())}", flush=True)
+                        sys.stdout.flush()
+                else:
+                    print(f"[ERROR] File was not created: {hdf5_file}", flush=True)
+                    sys.stdout.flush()
+                    
+            except Exception as e:
+                print(f"[ERROR] Could not process {fif_file}: {str(e)}", flush=True)
+                sys.stdout.flush()
+                import traceback
+                traceback.print_exc()
+                continue
+                
+        print(f"[DEBUG] Finished processing {len(fif_files)} files", flush=True)
+        sys.stdout.flush()
+        return [1]
+
+    def convert_all_test(self):
+        """Test conversion without multiprocessing for debugging"""
+        print("[TEST] Running conversion without multiprocessing", flush=True)
+        sys.stdout.flush()
+        fif_files, fif_names = self.get_files()
+        
+        if self.num_files != -1:
+            fif_files = fif_files[:self.num_files]
+            
+        print(f"[TEST] Found {len(fif_files)} FIF files to process", flush=True)
+        sys.stdout.flush()
+        
+        for i, fif_file in enumerate(fif_files[:1]):  # Only process first file for testing
+            print(f"[TEST] Processing file {i+1}/{min(1, len(fif_files))}: {fif_file}", flush=True)
+            sys.stdout.flush()
+            
+            if fif_file.endswith(".fif"):
+                replace_str = ".fif"
+            elif fif_file.endswith(".FIF"):
+                replace_str = ".FIF"
+            hdf5_file = os.path.join(self.target_dir, fif_file.split('/')[-1].replace(replace_str, '.hdf5'))
+            
+            print(f"[TEST] Output will be: {hdf5_file}", flush=True)
+            sys.stdout.flush()
+            
+            try:
+                self.convert(fif_file, hdf5_file)
+                print(f"[TEST] Conversion successful", flush=True)
+                sys.stdout.flush()
+                
+                # Verify the output
+                if os.path.exists(hdf5_file):
+                    print(f"[TEST] Verifying output file...", flush=True)
+                    sys.stdout.flush()
+                    with h5py.File(hdf5_file, 'r') as f:
+                        print(f"[TEST] File contains {len(f.keys())} datasets", flush=True)
+                        sys.stdout.flush()
+                        for key in f.keys():
+                            dataset = f[key]
+                            print(f"[TEST]  {key}: shape={dataset.shape}, dtype={dataset.dtype}", flush=True)
+                            sys.stdout.flush()
+                else:
+                    print(f"[TEST] ERROR: Output file was not created", flush=True)
+                    sys.stdout.flush()
+                    
+            except Exception as e:
+                print(f"[TEST] ERROR: {str(e)}", flush=True)
+                sys.stdout.flush()
+                import traceback
+                traceback.print_exc()
+                
+        print("[TEST] Test conversion complete", flush=True)
+        sys.stdout.flush()
+
+    def convert_all(self):
+        fif_files, fif_names = self.get_files() 
+        # folders = self.get_folders()
+        for fif_file in tqdm(fif_files, desc="Converting FIF files"):
+            # fif_files = [os.path.join(folder, f) for f in os.listdir(os.path.join(self.root_dir,folder)) if f.endswith('.fif')]
+            # fif_file = os.path.join(self.root_dir,fif_files[0])
+            if fif_file.endswith(".fif"):
+                replace_str = ".fif"
+            elif fif_file.endswith(".FIF"):
+                replace_str = ".FIF"
+            hdf5_file = os.path.join(self.target_dir,fif_file.split('/')[-1].replace(replace_str, '.hdf5'))
+            # logger.info(fif_file)
+            # logger.info(hdf5_file)
+
+            try:
+                self.convert(fif_file, hdf5_file)
+            except Exception as e:
+                warnings.warn(f"Warning: Could not process the file {fif_file}. Error: {str(e)}")
+                continue
+
+    def convert_all_multiprocessing(self):
+        print(f"[INFO] Starting sequential conversion (no multiprocessing)", flush=True)
+        fif_files, fif_names = self.get_files() 
+
+        if self.num_files != -1:
+            fif_files = fif_files[:self.num_files]
+
+        print(f"[INFO] Processing {len(fif_files)} files sequentially", flush=True)
+        
+        # Process files one by one instead of using multiprocessing
+        for i, fif_file in enumerate(fif_files):
+            print(f"\n[INFO] Processing file {i+1}/{len(fif_files)}: {fif_file}", flush=True)
+            
+            if fif_file.endswith(".fif"):
+                replace_str = ".fif"
+            elif fif_file.endswith(".FIF"):
+                replace_str = ".FIF"
+            hdf5_file = os.path.join(self.target_dir, fif_file.split('/')[-1].replace(replace_str, '.hdf5'))
+            
+           # if os.path.exists(hdf5_file):
+           #     print(f"[INFO] File already exists, skipping: {hdf5_file}", flush=True)
+           #     continue
+                
+            try:
+                print(f"[INFO] Converting {fif_file} to {hdf5_file}", flush=True)
+                self.convert(fif_file, hdf5_file)
+                print(f"[INFO] Successfully converted {fif_file}", flush=True)
+                
+                # Verify the file was created
+                if os.path.exists(hdf5_file):
+                    with h5py.File(hdf5_file, 'r') as f:
+                        print(f"[INFO] Created HDF5 with {len(f.keys())} datasets: {list(f.keys())}", flush=True)
+                else:
+                    print(f"[ERROR] File was not created: {hdf5_file}", flush=True)
+                    
+            except Exception as e:
+                print(f"[ERROR] Failed to process {fif_file}: {str(e)}", flush=True)
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print(f"\n[INFO] Sequential conversion complete", flush=True)
+
+    def plot_results(self, resampled_signals, channel_names):
+        print("plotting resampled_signals")
+        num_signals = len(resampled_signals)
+        fig, axs = plt.subplots(num_signals, 1, figsize=(15, 3*num_signals), sharex=True)
+        samples_to_plot = 10 * self.resample_rate
+        sample_to_start = 10 * self.resample_rate
+        for i, (signal, name) in enumerate(zip(resampled_signals, channel_names)):
+            signal_chunk = signal[sample_to_start:sample_to_start+samples_to_plot]
+            axs[i].plot(signal_chunk)
+            axs[i].set_title(name)
+            axs[i].set_ylabel('Amplitude')
+        
+        axs[-1].set_xlabel('Samples')
+        plt.tight_layout()
+        plt.show()
+
+    def plot_first_results(self, resampled_signals, channel_names):
+        print("plotting resampled_signals")
+        num_signals = len(resampled_signals)
+        fig = plt.figure(figsize=(15, 3))
+        samples_to_plot = 10 * self.resample_rate
+        sample_to_start = 10 * self.resample_rate
+        for i, (signal, name) in enumerate(zip(resampled_signals, channel_names)):
+            signal_chunk = signal[sample_to_start:sample_to_start+samples_to_plot]
+            plt.plot(signal_chunk)
+            plt.title(name)
+            plt.ylabel('Amplitude')
+            break
+        
+        plt.xlabel('Samples')
+        plt.tight_layout()
+        plt.show()
+
+    def process_and_plot_single_file(self, fif_path):
+        signals, sample_rates, channel_names = self.read_fif(fif_path)
+        resampled_signals = self.resample_signals(signals, sample_rates)
+        #self.plot_results(resampled_signals, channel_names)
+        self.plot_first_results(resampled_signals, channel_names)
     
 
 def main():
     parser = argparse.ArgumentParser(description="Process data and create hdf5")
-    parser.add_argument('--root_dir', type=str, required=True, help='Path to edf')
-    parser.add_argument('--target_dir', type=str, required=True, help='Path to save hdf5')
+  #  parser.add_argument('--root_dir', type=str, required=True, help='Path to edf')
+  #  parser.add_argument('--target_dir', type=str, required=True, help='Path to save hdf5')
     parser.add_argument("--num_threads", type=int, default=4, help="Number of threads for parallel processing")
     parser.add_argument("--num_files", type=int, default=-1, help="Number of files to process. If -1, process all")
     parser.add_argument("--resample_rate", type=int, default=256, help="Target sampling rate for hdf5 file.")
     args = parser.parse_args()
 
-    os.makedirs(args.target_dir, exist_ok=True)
+    target_dir = '/home/triniborrell/home/projects/sleepfm-clinical/output'
+    os.makedirs(target_dir, exist_ok=True)
 
-    converter = EDFToHDF5Converter(root_dir=args.root_dir,
-                                target_dir=args.target_dir, 
-                                num_threads=args.num_threads, 
-                                num_files=args.num_files,
-                                resample_rate=args.resample_rate)
+ #   converter = EDFToHDF5Converter(root_dir=args.root_dir,
+ #                               target_dir=args.target_dir, 
+ #                               num_threads=args.num_threads, 
+ #                               num_files=args.num_files,
+ #                               resample_rate=args.resample_rate)
 
+  #  converter.convert_all_multiprocessing()
+
+    converter = FIFToHDF5Converter(root_dir= '/data/project/eeg_foundation/data/data_250Hz_EGI256/nice_epochs_from_cohen_2/nice_epochs/nice_epochs2/sub-JD144/ses-01/eeg',
+                                target_dir= target_dir, 
+                                num_threads=1, 
+                                num_files=1,
+                                resample_rate=128)
+
+    # Use sequential processing (no multiprocessing) for debugging
     converter.convert_all_multiprocessing()
 
 

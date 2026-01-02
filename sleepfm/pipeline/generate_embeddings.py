@@ -4,7 +4,7 @@ from torch import nn
 from loguru import logger
 import os
 import sys
-sys.path.append("../")
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import *
 from models.dataset import SetTransformerDataset, collate_fn
 from models.models import SetTransformer
@@ -20,10 +20,10 @@ import h5py
 
 
 @click.command("generate_embeddings")
-@click.option("--model_path", type=str, default='path')
-@click.option("--dataset_name", type=str, default='mesa')
-@click.option("--channel_groups_path", type=str, default='../configs/channel_groups.json')
-@click.option("--split_path", type=str, default='../configs/dataset_split.json')
+@click.option("--model_path", type=str, default='/home/triniborrell/home/projects/sleepfm-clinical/sleepfm/pretrained_model/')
+@click.option("--dataset_name", type=str, default='jd144')
+@click.option("--channel_groups_path", type=str, default='/home/triniborrell/home/projects/sleepfm-clinical/sleepfm/configs/channel_groups_egi_fixed.json')
+@click.option("--split_path", type=str, default='/home/triniborrell/home/projects/sleepfm-clinical/sleepfm/configs/dataset_split_new.json')
 @click.option("--splits", type=str, default='train,validation,test')
 @click.option("--num_workers", type=int, default=16)
 @click.option("--batch_size", type=int, default=128)
@@ -66,25 +66,70 @@ def generate_embeddings(
 
     logger.info(f"Batch Size: {batch_size}; Number of Workers: {num_workers}")
 
-    device = torch.device("cuda")
-    logger.info(f"Device set to Cuda")
+    device = torch.device("cpu")
+    logger.info(f"Device set to CPU")
 
     start = time.time()
     split_dataset = load_data(split_path)
     splits = splits.split(",")
 
+    # Debug: Print split dataset info
+    logger.info(f"Split dataset keys: {list(split_dataset.keys())}")
+    for split in splits:
+        logger.info(f"Split '{split}' has {len(split_dataset.get(split, []))} files")
+
     if dataset_name.lower() in ["shhs1", "shhs2"]:
         path_to_data = os.path.join(data_path, f"SHHS/{dataset_name}")
-        hdf5_paths = [os.path.join(path_to_data, file_name) for file_name in os.listdir(path_to_data)]
+        if not os.path.exists(path_to_data):
+            logger.error(f"SHHS data path does not exist: {path_to_data}")
+            return
+        hdf5_paths = [os.path.join(path_to_data, file_name) for file_name in os.listdir(path_to_data) if file_name.endswith('.hdf5')]
     else:
         hdf5_paths = []
         for split in splits:
+            if split not in split_dataset:
+                logger.warning(f"Split '{split}' not found in dataset split file")
+                continue
             filtered_files = [fp for fp in split_dataset[split] if dataset_name in fp.lower()]
+            logger.info(f"Split '{split}': Found {len(filtered_files)} files matching dataset '{dataset_name}'")
+            logger.debug(f"Filtered files: {filtered_files}")
+            
+            # Fallback: if no files match dataset name, use all files from split
+            if len(filtered_files) == 0 and len(split_dataset[split]) > 0:
+                logger.warning(f"No files matched dataset name '{dataset_name}' in split '{split}'")
+                logger.info(f"Available files in split '{split}': {split_dataset[split]}")
+                logger.info(f"Using all files from split '{split}' as fallback")
+                filtered_files = split_dataset[split].copy()
+            
             hdf5_paths += filtered_files
         
+        # Check if data_path should be the preprocessing output directory
+        if data_path.endswith('/eeg') and '/nice_epochs2/' in data_path:
+            # This looks like raw FIF data path, use preprocessing output instead
+            preprocessing_output = '/home/triniborrell/home/projects/sleepfm-clinical/output'
+            logger.warning(f"Data path appears to be raw FIF data: {data_path}")
+            logger.info(f"Using preprocessing output directory: {preprocessing_output}")
+            data_path = preprocessing_output
+        
         hdf5_paths = [os.path.join(data_path, file) for file in hdf5_paths]
+        
+        # Verify files exist
+        existing_paths = []
+        for path in hdf5_paths:
+            if os.path.exists(path):
+                existing_paths.append(path)
+            else:
+                logger.warning(f"File not found: {path}")
+        hdf5_paths = existing_paths
 
     logger.info(f"Number of files to process: {len(hdf5_paths)}")
+    if len(hdf5_paths) == 0:
+        logger.error("No files found to process. Check:")
+        logger.error(f"1. Data path: {data_path}")
+        logger.error(f"2. Dataset name: {dataset_name}")
+        logger.error(f"3. Split file: {split_path}")
+        logger.error(f"4. File extensions in data directory: {os.listdir(data_path) if os.path.exists(data_path) else 'Directory not found'}")
+        return
 
     dataset = SetTransformerDataset(config, channel_groups, hdf5_paths=hdf5_paths, split="test")
     dataloader = torch.utils.data.DataLoader(dataset, 
@@ -105,16 +150,22 @@ def generate_embeddings(
     logger.info(f'Trainable parameters: {total_params / 1e6:.2f} million')
     logger.info(f'Number of layers: {total_layers}')
 
-    checkpoint = torch.load(os.path.join(model_path, "best.pt"))
-    model.load_state_dict(checkpoint["state_dict"])
+
+    checkpoint = torch.load(os.path.join(model_path, "best.pt"), map_location=torch.device('cpu'))
+    # Remove 'module.' prefix from checkpoint keys (saved with DataParallel)
+    state_dict = checkpoint["state_dict"]
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
 
     with torch.no_grad():
         with tqdm.tqdm(total=len(dataloader)) as pbar:
             for batch in dataloader:
                 batch_data, mask_list, file_paths, dset_names_list, chunk_starts = batch
-                (bas, resp, ekg, emg) = batch_data
-                (mask_bas, mask_resp, mask_ekg, mask_emg) = mask_list
+#                (bas, resp, ekg, emg) = batch_data
+                bas = batch_data
+#                (mask_bas, mask_resp, mask_ekg, mask_emg) = mask_list
+                mask_bas = mask_list
 
                 bas = bas.to(device, dtype=torch.float)
                 resp = resp.to(device, dtype=torch.float)

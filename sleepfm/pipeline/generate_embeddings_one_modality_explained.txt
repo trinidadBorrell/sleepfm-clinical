@@ -1,0 +1,97 @@
+================================================================================
+EMBEDDING GENERATION PIPELINE - generate_embeddings_one_modality.py
+================================================================================
+
+OVERVIEW
+--------
+This script generates embeddings from FIF files using the pretrained SleepFM 
+model with a single modality (256 EEG channels as BAS).
+
+INPUT DATA
+----------
+- FIF files containing epochs of shape (n_epochs, 256 channels, timepoints)
+- Each epoch is exactly 5 seconds at 200 Hz (resampled to 128 Hz for SleepFM)
+- Path structure: /data/project/eeg_foundation/data/DoC_rs_resampled_5s/sub-{ID}/04_clean_eeg/clean/EEG-epo.fif
+
+SEQUENCE CONSTRUCTION
+---------------------
+The pipeline groups multiple 5-second epochs into sequences:
+
+- epochs_per_sequence = 6 (default)
+- Each sequence = 6 epochs × 5 seconds = 30 seconds
+- Epochs are concatenated along the time axis before being fed to the model
+
+Example for subject with 41 epochs:
+  - n_sequences = 41 // 6 = 6 complete sequences (last incomplete sequence discarded)
+  - Each sequence contains 6 tokens (one per 5-second epoch)
+
+Note: The original SleepFM paper mentions a 5-minute context window, but this
+implementation uses 30-second sequences by default.
+
+OUTPUT FILES
+------------
+1. doc_embeddings/{subject_id}.hdf5
+   - 'embedding': Mean embedding across all sequences, shape (128,)
+   - 'embedding_per_sequence': Pooled embedding per sequence, shape (n_sequences, 128)
+   - Attributes: num_epochs, num_sequences, epochs_per_sequence, embed_dim
+
+2. doc_embeddings_per_epoch/{subject_id}.hdf5
+   - 'pooled': Same as embedding_per_sequence, shape (n_sequences, 128)
+   - 'sequence': Per-token embeddings BEFORE pooling, shape (n_sequences, 6, 128)
+   - Attributes: num_sequences, epochs_per_sequence
+
+SHAPE INTERPRETATION
+--------------------
+For a subject with 41 epochs and epochs_per_sequence=6:
+
+| Dataset               | Shape      | Meaning                                    |
+|-----------------------|------------|--------------------------------------------|
+| embedding             | (128,)     | Single aggregated embedding for subject    |
+| embedding_per_sequence| (6, 128)   | 6 sequences × 128-dim pooled embedding     |
+| pooled                | (6, 128)   | Same as embedding_per_sequence             |
+| sequence              | (6, 6, 128)| 6 sequences × 6 tokens × 128-dim embedding |
+
+The 'sequence' tensor gives you the transformer output for each 5-second token
+BEFORE the pooling operation aggregates them into one vector per sequence.
+
+INCOMPLETE SEQUENCE HANDLING
+-----------------------------
+Incomplete sequences (where the remaining epochs < epochs_per_sequence) are 
+DISCARDED to ensure all embeddings correspond to complete, meaningful data.
+No zero-padding is used.
+
+BATCH SIZE EXPLANATION
+----------------------
+The --batch_size parameter controls how many SEQUENCES are processed together
+in a single GPU forward pass. It does NOT refer to channels or epochs.
+
+Tensor shape during inference: (batch_size, n_channels, time)
+  - batch_size: Number of sequences in the batch (default: 32)
+  - n_channels: 256 EEG channels (fixed)
+  - time: epochs_per_sequence × samples_per_epoch = 6 × 640 = 3840 samples
+
+Example with batch_size=32 and epochs_per_sequence=6:
+  - Each batch processes 32 sequences simultaneously
+  - Each sequence is 30 seconds (6 epochs × 5 seconds)
+  - Input tensor shape: (32, 256, 3840)
+
+For a subject with 41 epochs (6 complete sequences after discarding):
+  - All 6 sequences fit in one batch (6 < 32)
+  - Only one forward pass needed
+
+For a subject with 300 epochs (50 sequences):
+  - First batch: sequences 0-31 (32 sequences)
+  - Second batch: sequences 32-49 (18 sequences)
+  - Two forward passes needed
+
+Larger batch sizes improve GPU utilization but require more memory.
+Reduce batch_size if you encounter CUDA out-of-memory errors.
+
+CONFIGURABLE PARAMETERS
+-----------------------
+- --batch_size: Number of sequences per GPU forward pass (default: 32)
+- --epochs_per_sequence: Number of 5-second epochs per sequence (default: 6)
+- --max_seq_length: Max sequence length for positional encoding (default: 128)
+- --target_sample_rate: Resampling rate for SleepFM (default: 128 Hz)
+
+================================================================================
